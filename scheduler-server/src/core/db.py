@@ -209,9 +209,9 @@ def ensure_runtime_schema() -> None:
                     initiator_agent_id INTEGER NULL,
                     max_turns INTEGER NOT NULL DEFAULT 0,
                     current_turn INTEGER NOT NULL DEFAULT 0,
-                    window_seconds INTEGER NOT NULL DEFAULT 300,
-                    soft_message_limit INTEGER NOT NULL DEFAULT 12,
-                    hard_message_limit INTEGER NOT NULL DEFAULT 20,
+                    window_seconds INTEGER NOT NULL DEFAULT 600,
+                    soft_message_limit INTEGER NOT NULL DEFAULT 30,
+                    hard_message_limit INTEGER NOT NULL DEFAULT 50,
                     soft_limit_warned_at DATETIME NULL,
                     last_speaker_agent_id INTEGER NULL,
                     last_speaker_runtime_target_id INTEGER NULL,
@@ -264,9 +264,9 @@ def ensure_runtime_schema() -> None:
                             initiator_agent_id INTEGER NULL,
                             max_turns INTEGER NOT NULL DEFAULT 0,
                             current_turn INTEGER NOT NULL DEFAULT 0,
-                            window_seconds INTEGER NOT NULL DEFAULT 300,
-                            soft_message_limit INTEGER NOT NULL DEFAULT 12,
-                            hard_message_limit INTEGER NOT NULL DEFAULT 20,
+                            window_seconds INTEGER NOT NULL DEFAULT 600,
+                            soft_message_limit INTEGER NOT NULL DEFAULT 30,
+                            hard_message_limit INTEGER NOT NULL DEFAULT 50,
                             soft_limit_warned_at DATETIME NULL,
                             last_speaker_agent_id INTEGER NULL,
                             last_speaker_runtime_target_id INTEGER NULL,
@@ -281,9 +281,9 @@ def ensure_runtime_schema() -> None:
                 initiator_agent_select = "initiator_agent_id" if "initiator_agent_id" in dialogue_columns else "NULL"
                 max_turns_select = "max_turns" if "max_turns" in dialogue_columns else "0"
                 current_turn_select = "current_turn" if "current_turn" in dialogue_columns else "0"
-                window_seconds_select = "window_seconds" if "window_seconds" in dialogue_columns else "300"
-                soft_message_limit_select = "soft_message_limit" if "soft_message_limit" in dialogue_columns else "12"
-                hard_message_limit_select = "hard_message_limit" if "hard_message_limit" in dialogue_columns else "20"
+                window_seconds_select = "window_seconds" if "window_seconds" in dialogue_columns else "600"
+                soft_message_limit_select = "soft_message_limit" if "soft_message_limit" in dialogue_columns else "30"
+                hard_message_limit_select = "hard_message_limit" if "hard_message_limit" in dialogue_columns else "50"
                 soft_limit_warned_at_select = "soft_limit_warned_at" if "soft_limit_warned_at" in dialogue_columns else "NULL"
                 last_speaker_agent_select = "last_speaker_agent_id" if "last_speaker_agent_id" in dialogue_columns else "NULL"
                 last_speaker_runtime_select = (
@@ -335,11 +335,11 @@ def ensure_runtime_schema() -> None:
                 connection.execute(text("PRAGMA foreign_keys=ON"))
         else:
             if "window_seconds" not in dialogue_columns:
-                statements.append("ALTER TABLE agent_dialogues ADD COLUMN window_seconds INTEGER NOT NULL DEFAULT 300")
+                statements.append("ALTER TABLE agent_dialogues ADD COLUMN window_seconds INTEGER NOT NULL DEFAULT 600")
             if "soft_message_limit" not in dialogue_columns:
-                statements.append("ALTER TABLE agent_dialogues ADD COLUMN soft_message_limit INTEGER NOT NULL DEFAULT 12")
+                statements.append("ALTER TABLE agent_dialogues ADD COLUMN soft_message_limit INTEGER NOT NULL DEFAULT 30")
             if "hard_message_limit" not in dialogue_columns:
-                statements.append("ALTER TABLE agent_dialogues ADD COLUMN hard_message_limit INTEGER NOT NULL DEFAULT 20")
+                statements.append("ALTER TABLE agent_dialogues ADD COLUMN hard_message_limit INTEGER NOT NULL DEFAULT 50")
             if "soft_limit_warned_at" not in dialogue_columns:
                 statements.append("ALTER TABLE agent_dialogues ADD COLUMN soft_limit_warned_at DATETIME NULL")
             if "source_runtime_target_id" not in dialogue_columns:
@@ -457,6 +457,30 @@ def ensure_runtime_schema() -> None:
         if "role_name" not in hermes_columns:
             statements.append("ALTER TABLE hermes_instances ADD COLUMN role_name VARCHAR(120)")
 
+    if "claude_code_instances" not in table_names:
+        statements.append(
+            """
+            CREATE TABLE IF NOT EXISTS claude_code_instances (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                instance_key VARCHAR(36) NOT NULL UNIQUE,
+                runtime_target_id INTEGER NULL,
+                name VARCHAR(120) NOT NULL,
+                cs_id VARCHAR(32) NULL,
+                display_name VARCHAR(120) NOT NULL,
+                role_name VARCHAR(120) NULL,
+                workspace_dir VARCHAR(500) NOT NULL,
+                allowed_tools_json TEXT NULL,
+                model_override VARCHAR(120) NULL,
+                system_prompt TEXT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        statements.append("CREATE INDEX IF NOT EXISTS ix_claude_code_instances_runtime_target_id ON claude_code_instances (runtime_target_id)")
+        statements.append("CREATE INDEX IF NOT EXISTS ix_claude_code_instances_cs_id ON claude_code_instances (cs_id)")
+
     if "hermes_conversation_states" in table_names and is_sqlite:
         state_columns = {column["name"] for column in inspector.get_columns("hermes_conversation_states")}
         if "hermes_profile_id" in state_columns:
@@ -520,6 +544,60 @@ def ensure_runtime_schema() -> None:
             statements.append("UPDATE projects SET members_json = '[]' WHERE members_json IS NULL OR members_json = ''")
         if "member_count" in project_columns:
             statements.append("ALTER TABLE projects DROP COLUMN member_count")
+
+    if "chat_group_members" in table_names:
+        cm_columns_info = {col["name"]: col for col in inspector.get_columns("chat_group_members")}
+        cm_columns = set(cm_columns_info)
+        cm_needs_rebuild = is_sqlite and (
+            "runtime_target_id" not in cm_columns
+            or any(
+                cm_columns_info.get(col, {}).get("nullable") is False
+                for col in ["instance_id", "agent_id"]
+            )
+        )
+        if cm_needs_rebuild:
+            with engine.begin() as connection:
+                connection.execute(text("PRAGMA foreign_keys=OFF"))
+                connection.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS chat_group_members__new (
+                            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                            group_id INTEGER NOT NULL,
+                            instance_id INTEGER NULL,
+                            agent_id INTEGER NULL,
+                            runtime_target_id INTEGER NULL,
+                            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY(group_id) REFERENCES chat_groups (id),
+                            FOREIGN KEY(instance_id) REFERENCES openclaw_instances (id),
+                            FOREIGN KEY(agent_id) REFERENCES agent_profiles (id)
+                        )
+                        """
+                    )
+                )
+                rt_select = "runtime_target_id" if "runtime_target_id" in cm_columns else "NULL"
+                connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO chat_group_members__new (
+                            id, group_id, instance_id, agent_id, runtime_target_id, joined_at
+                        )
+                        SELECT id, group_id, instance_id, agent_id, {rt_select}, joined_at
+                        FROM chat_group_members
+                        """
+                    )
+                )
+                connection.execute(text("DROP TABLE chat_group_members"))
+                connection.execute(text("ALTER TABLE chat_group_members__new RENAME TO chat_group_members"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_group_members_group_id ON chat_group_members (group_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_group_members_instance_id ON chat_group_members (instance_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_group_members_agent_id ON chat_group_members (agent_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_group_members_runtime_target_id ON chat_group_members (runtime_target_id)"))
+                connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_group_runtime_target ON chat_group_members (group_id, runtime_target_id)"))
+                connection.execute(text("PRAGMA foreign_keys=ON"))
+        elif "runtime_target_id" not in cm_columns:
+            statements.append("ALTER TABLE chat_group_members ADD COLUMN runtime_target_id INTEGER")
+            statements.append("CREATE INDEX IF NOT EXISTS ix_chat_group_members_runtime_target_id ON chat_group_members (runtime_target_id)")
 
     if not statements:
         return

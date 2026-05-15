@@ -34,9 +34,19 @@
       :placeholder="isAgentDialogue ? t('conversation.agentDialogueInputPlaceholder') : t('conversation.inputPlaceholder')"
       @keydown="handleKeydown"
     />
+    <div v-if="attachmentUrl" class="composer__attachment-preview">
+      <span class="composer__attachment-name">{{ attachmentName }}</span>
+      <el-button size="small" text type="danger" @click="clearAttachment">{{ t("conversation.remove") }}</el-button>
+    </div>
     <div class="composer__actions">
       <div class="composer__tools">
-        <el-button plain disabled>
+        <input
+          ref="fileInput"
+          type="file"
+          style="display: none"
+          @change="handleFileSelect"
+        />
+        <el-button plain :loading="uploading" @click="pickFile">
           {{ t("conversation.attachment") }}
         </el-button>
       </div>
@@ -70,7 +80,7 @@
             </div>
           </div>
         </el-popover>
-        <el-button type="primary" native-type="submit" :disabled="sending || !content.trim()">
+        <el-button type="primary" native-type="submit" :disabled="sending || uploading || !content.trim()">
           {{ sending ? t("conversation.sending") : (isAgentDialogue ? t("conversation.insertGuidance") : t("conversation.sendMessage")) }}
         </el-button>
       </div>
@@ -80,6 +90,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
+import { apiClient } from "@/api/client";
 import { useI18n } from "@/composables/useI18n";
 
 type SendShortcut = {
@@ -113,6 +124,11 @@ const mentions = ref<string[]>([]);
 const useDedicatedDirectSession = ref(false);
 const sendShortcut = ref<SendShortcut>({ ...DEFAULT_SHORTCUT });
 const shortcutRecording = ref(false);
+const fileInput = ref<HTMLInputElement | null>(null);
+const uploading = ref(false);
+const attachmentUrl = ref("");
+const attachmentName = ref("");
+const attachmentMime = ref("");
 const { t } = useI18n();
 
 if (typeof window !== "undefined") {
@@ -175,12 +191,16 @@ function submit() {
     if (!content.value.trim()) {
         return;
     }
+    const attachmentTag = attachmentUrl.value
+        ? `\n\n[[attachment:${attachmentName.value}|${attachmentMime.value}|${attachmentUrl.value}]]`
+        : "";
     emit("send", {
-        content: content.value.trim(),
+        content: content.value.trim() + attachmentTag,
         mentions: [...mentions.value],
         useDedicatedDirectSession: useDedicatedDirectSession.value,
     });
     content.value = "";
+    clearAttachment();
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -213,6 +233,37 @@ function startShortcutRecording() {
 function resetShortcut() {
     shortcutRecording.value = false;
     sendShortcut.value = { ...DEFAULT_SHORTCUT };
+}
+
+function pickFile() {
+    fileInput.value?.click();
+}
+
+async function handleFileSelect(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) { return; }
+    uploading.value = true;
+    try {
+        const form = new FormData();
+        form.append("file", file);
+        const res = await apiClient.post("/api/upload", form);
+        const data = res.data;
+        attachmentUrl.value = data.url;
+        attachmentName.value = data.name;
+        attachmentMime.value = data.mime;
+    } catch {
+        attachmentUrl.value = "";
+    } finally {
+        uploading.value = false;
+        input.value = "";
+    }
+}
+
+function clearAttachment() {
+    attachmentUrl.value = "";
+    attachmentName.value = "";
+    attachmentMime.value = "";
 }
 
 function captureShortcut(event: KeyboardEvent) {
@@ -327,6 +378,24 @@ function captureShortcut(event: KeyboardEvent) {
   font-size: 0.92rem;
   font-weight: 600;
   color: var(--color-text-primary);
+}
+
+.composer__attachment-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-app);
+}
+
+.composer__attachment-name {
+  flex: 1;
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .composer__shortcut-hint {

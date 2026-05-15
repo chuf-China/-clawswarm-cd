@@ -216,6 +216,7 @@
     <GroupCreateDrawer
       v-model:visible="createDrawerVisible"
       :instances="instances"
+      :runtime-targets="runtimeTargets"
       :submitting="groupStore.creating"
       @submit="handleCreateGroup"
     />
@@ -230,6 +231,7 @@
       v-model:visible="memberDrawerVisible"
       :group="groupStore.currentGroupDetail"
       :instances="instances"
+      :runtime-targets="runtimeTargets"
       :saving="groupStore.savingMembers"
       @add-members="handleAddMembers"
       @delete-group="handleDeleteGroup"

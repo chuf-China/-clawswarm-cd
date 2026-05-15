@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from src.api.routes import (
     address_book,
@@ -14,6 +15,7 @@ from src.api.routes import (
     agents,
     auth,
     callbacks,
+    claude_code,
     conversations,
     groups,
     health,
@@ -21,6 +23,7 @@ from src.api.routes import (
     instances,
     projects,
     runtime_targets,
+    upload,
     ws,
 )
 from src.core.config import settings
@@ -100,6 +103,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(claude_code.router)
     app.include_router(hermes.router)
     app.include_router(instances.router)
     app.include_router(agents.router)
@@ -111,7 +115,13 @@ def create_app() -> FastAPI:
     app.include_router(projects.agent_router)
     app.include_router(runtime_targets.router)
     app.include_router(callbacks.router)
+    app.include_router(upload.router)
     app.include_router(ws.router)
+
+    uploads_dir = Path(__file__).resolve().parent.parent / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+
     _configure_web_client_routes(app)
 
     return app

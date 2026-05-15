@@ -11,6 +11,7 @@ from src.models.hermes_instance import HermesInstance
 from src.models.message import Message
 from src.models.message_callback_event import MessageCallbackEvent
 from src.models.message_dispatch import MessageDispatch
+from src.models.claude_code_instance import ClaudeCodeInstance
 from src.models.openclaw_instance import OpenClawInstance
 from src.models.project import Project
 from src.models.project_document import ProjectDocument
@@ -30,6 +31,7 @@ __all__ = [
     "Message",
     "MessageCallbackEvent",
     "MessageDispatch",
+    "ClaudeCodeInstance",
     "OpenClawInstance",
     "Project",
     "ProjectDocument",

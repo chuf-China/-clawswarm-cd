@@ -9,12 +9,15 @@ import type {
     AddressBookGroupResponse,
     AddressBookInstanceResponse,
     AddressBookResponse,
+    AddressBookRuntimeTargetResponse,
 } from "@/types/api/addressBook";
 import type { Camelized } from "@/utils/case";
 
 export type AddressBookAgentOutput = Camelized<AddressBookAgentResponse>;
 
 export type AddressBookInstanceOutput = Camelized<AddressBookInstanceResponse>;
+
+export type AddressBookRuntimeTargetOutput = Camelized<AddressBookRuntimeTargetResponse>;
 
 export type AddressBookGroupMemberOutput = Camelized<AddressBookGroupMemberResponse>;
 

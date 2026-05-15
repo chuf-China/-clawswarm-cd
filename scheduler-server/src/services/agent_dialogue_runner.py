@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from src.integrations.channel_client import channel_client
 from src.models.agent_dialogue import AgentDialogue
 from src.models.agent_profile import AgentProfile
+from src.models.claude_code_instance import ClaudeCodeInstance
 from src.models.conversation import Conversation
 from src.models.hermes_conversation_state import HermesConversationState
 from src.models.hermes_instance import HermesInstance
@@ -20,6 +21,12 @@ from src.models.message_dispatch import MessageDispatch
 from src.models.openclaw_instance import OpenClawInstance
 from src.models.runtime_target import RuntimeTarget
 from src.services.agent_dialogue_context_builder import build_runtime_dialogue_context_text
+from src.services.claude_code_dispatch_service import (
+    _conversation_state,
+    _find_gateway_instance,
+    _publish_update,
+    _stream_from_gateway,
+)
 from src.services.agent_dialogue_state_service import (
     apply_dialogue_window_guards,
     find_latest_undispatched_message,
@@ -29,6 +36,7 @@ from src.services.agent_dialogue_state_service import (
 )
 from src.services.default_user import get_default_user_identity
 from src.services.hermes_dispatch_service import (
+    _resolve_attachment_paths,
     build_hermes_response_payload,
     mark_hermes_dispatch_failed,
     publish_hermes_update,
@@ -46,25 +54,39 @@ async def dispatch_agent_dialogue_opening_turn(
     dialogue: AgentDialogue,
     opening_message: Message,
     session_local=None,
-) -> str | None:
-    """Send the first turn of a dialogue to its source agent."""
+) -> list[str]:
+    """Send the opening turn to BOTH agents simultaneously.
+
+    Each agent receives the full context independently. The first to
+    finish will have their reply forwarded to the other via the normal
+    relay loop (continue_agent_dialogue_after_reply → has_in_flight_dispatch
+    guard ensures we don't stack concurrent dispatches).
+    """
     ensure_dialogue_runtime_targets(db=db, dialogue=dialogue)
     source_target = get_dialogue_runtime_target(db=db, dialogue=dialogue, target_id=dialogue.source_runtime_target_id)
+    target_target = get_dialogue_runtime_target(db=db, dialogue=dialogue, target_id=dialogue.target_runtime_target_id)
     conversation = db.get(Conversation, dialogue.conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="conversation not found")
 
-    return await dispatch_agent_dialogue_turn(
-        db=db,
-        dialogue=dialogue,
-        conversation=conversation,
-        message=opening_message,
-        recipient_target=source_target,
-        sender_label=DEFAULT_USER.label_with_cs_id,
-        sender_user_id=DEFAULT_USER.internal_id,
-        dispatch_mode="agent_dialogue_opening",
-        session_local=session_local,
-    )
+    # Dispatch to both sequentially (the background tasks created inside
+    # each dispatch run in parallel, so both agents process concurrently).
+    ids: list[str] = []
+    for target in [source_target, target_target]:
+        rid = await dispatch_agent_dialogue_turn(
+            db=db,
+            dialogue=dialogue,
+            conversation=conversation,
+            message=opening_message,
+            recipient_target=target,
+            sender_label=DEFAULT_USER.label_with_cs_id,
+            sender_user_id=DEFAULT_USER.internal_id,
+            dispatch_mode="agent_dialogue_opening",
+            session_local=session_local,
+        )
+        if rid is not None:
+            ids.append(rid)
+    return ids
 
 
 async def continue_agent_dialogue_after_reply(
@@ -95,8 +117,6 @@ async def continue_agent_dialogue_after_reply(
     if current_speaker.runtime_type == "openclaw":
         dialogue.last_speaker_agent_id = current_speaker.runtime_profile_id
 
-    # Keep the latest speaker even while paused so a later resume can continue
-    # from the correct side.
     if dialogue.status != "active":
         db.commit()
         return None
@@ -120,6 +140,14 @@ async def continue_agent_dialogue_after_reply(
                 dispatch_mode="agent_dialogue_intervention",
                 session_local=session_local,
             )
+
+    # --- Parallel opening guard ---
+    # If the other agent is still processing (e.g. from the parallel opening
+    # dispatch), wait — the in-flight dispatch will trigger the next relay
+    # when it completes.
+    if has_in_flight_dispatch(db, dialogue):
+        db.commit()
+        return None
 
     next_target_id = pick_next_runtime_target_id(dialogue, current_speaker.id)
     if next_target_id is None:
@@ -167,6 +195,18 @@ async def dispatch_agent_dialogue_turn(
 
     if recipient_target.runtime_type == "hermes":
         return await dispatch_agent_dialogue_hermes_turn(
+            db=db,
+            dialogue=dialogue,
+            conversation=conversation,
+            message=message,
+            recipient_target=recipient_target,
+            sender_label=sender_label,
+            dispatch_mode=dispatch_mode,
+            session_local=session_local,
+        )
+
+    if recipient_target.runtime_type == "claude-code":
+        return await dispatch_agent_dialogue_claude_code_turn(
             db=db,
             dialogue=dialogue,
             conversation=conversation,
@@ -331,6 +371,10 @@ async def run_agent_dialogue_hermes_dispatch(*, session_local, dispatch_id: str)
             db.add(state)
             db.flush()
 
+        # Resolve attachment paths before sending to Gateway
+        if "[[attachment:" in (message.content or ""):
+            message.content = _resolve_attachment_paths(message.content)
+
         input_text = build_runtime_dialogue_context_text(
             db=db,
             dialogue=dialogue,
@@ -348,13 +392,19 @@ async def run_agent_dialogue_hermes_dispatch(*, session_local, dispatch_id: str)
         db.commit()
 
         try:
-            reply_text, response_id, conversation_key = await stream_hermes_response_to_message(
-                db=db,
-                instance=instance,
-                payload=payload,
-                conversation_id=dispatch.conversation_id,
-                reply_message=reply_message,
+            reply_text, response_id, conversation_key = await asyncio.wait_for(
+                stream_hermes_response_to_message(
+                    db=db,
+                    instance=instance,
+                    payload=payload,
+                    conversation_id=dispatch.conversation_id,
+                    reply_message=reply_message,
+                ),
+                timeout=900.0,
             )
+        except asyncio.TimeoutError:
+            mark_hermes_dispatch_failed(db=db, dispatch=dispatch, message=message, reply_message=reply_message, error_message="Hermes dispatch timed out (900s)")
+            return
         except httpx.TimeoutException:
             mark_hermes_dispatch_failed(db=db, dispatch=dispatch, message=message, reply_message=reply_message, error_message="Hermes timed out")
             return
@@ -394,6 +444,148 @@ async def run_agent_dialogue_hermes_dispatch(*, session_local, dispatch_id: str)
         state.last_response_id = response_id or state.last_response_id
         state.hermes_conversation_key = conversation_key or state.hermes_conversation_key
         db.commit()
+        await continue_agent_dialogue_after_reply(
+            db=db,
+            dialogue=dialogue,
+            dispatch=dispatch,
+            reply_message=reply_message,
+            session_local=session_local,
+        )
+
+
+async def dispatch_agent_dialogue_claude_code_turn(
+    *,
+    db: Session,
+    dialogue: AgentDialogue,
+    conversation: Conversation,
+    message: Message,
+    recipient_target: RuntimeTarget,
+    sender_label: str,
+    dispatch_mode: str,
+    session_local=None,
+) -> str | None:
+    """Create a Claude Code dialogue dispatch and run it in the background."""
+    instance = db.get(ClaudeCodeInstance, recipient_target.runtime_instance_id)
+    if not instance or instance.status == "disabled" or not recipient_target.enabled:
+        dialogue.status = "stopped"
+        db.commit()
+        return None
+
+    dispatch = MessageDispatch(
+        id=f"dsp_{uuid.uuid4().hex[:24]}",
+        message_id=message.id,
+        conversation_id=conversation.id,
+        runtime_target_id=recipient_target.id,
+        dispatch_mode=dispatch_mode,
+        channel_message_id=message.id,
+        status="pending",
+    )
+    reply_message = Message(
+        id=f"msg_cc_{dispatch.id}",
+        conversation_id=conversation.id,
+        sender_type="agent",
+        sender_label=recipient_target.display_name,
+        sender_cs_id=recipient_target.cs_id,
+        content="",
+        status="pending",
+    )
+    db.add(dispatch)
+    db.add(reply_message)
+    db.flush()
+    db.commit()
+
+    if session_local is not None:
+        asyncio.create_task(
+            _run_claude_code_dialogue_dispatch(
+                session_local=session_local,
+                dispatch_id=dispatch.id,
+            )
+        )
+    return dispatch.id
+
+
+async def _run_claude_code_dialogue_dispatch(
+    *,
+    session_local,
+    dispatch_id: str,
+) -> None:
+    """Run a pending Claude Code dialogue dispatch via Hermes Gateway."""
+    with session_local() as db:
+        dispatch = db.get(MessageDispatch, dispatch_id)
+        if not dispatch:
+            return
+        dialogue = db.scalar(select(AgentDialogue).where(AgentDialogue.conversation_id == dispatch.conversation_id))
+        message = db.get(Message, dispatch.message_id)
+        recipient_target = db.get(RuntimeTarget, dispatch.runtime_target_id) if dispatch.runtime_target_id else None
+        if not dialogue or not message or not recipient_target:
+            return
+        reply_message = db.get(Message, f"msg_cc_{dispatch.id}")
+        if not reply_message:
+            return
+
+        instance = db.get(ClaudeCodeInstance, recipient_target.runtime_instance_id)
+        if not instance:
+            dispatch.status = "failed"
+            message.status = "failed"
+            if reply_message is not None:
+                reply_message.status = "failed"
+            db.commit()
+            return
+
+        gateway = _find_gateway_instance(db)
+        # Resolve attachment paths before sending to Gateway
+        if "[[attachment:" in (message.content or ""):
+            message.content = _resolve_attachment_paths(message.content)
+        input_text = build_runtime_dialogue_context_text(
+            db=db,
+            dialogue=dialogue,
+            recipient_target=recipient_target,
+            message=message,
+            sender_label=message.sender_label,
+        )
+        if instance.system_prompt:
+            input_text = f"[System Instruction]\n{instance.system_prompt}\n\n{input_text}"
+
+        payload = {
+            "model": (gateway.default_model or gateway.instance_key).strip(),
+            "input": input_text,
+        }
+        prev_id = _conversation_state.get(dispatch.conversation_id)
+        if prev_id:
+            payload["previous_response_id"] = prev_id
+
+        dispatch.status = "streaming"
+        db.commit()
+
+        try:
+            reply_text, response_id = await asyncio.wait_for(
+                _stream_from_gateway(
+                    db=db,
+                    gateway=gateway,
+                    payload=payload,
+                    conversation_id=dispatch.conversation_id,
+                    reply_message=reply_message,
+                ),
+                timeout=300.0,
+            )
+        except Exception:
+            dispatch.status = "failed"
+            message.status = "failed"
+            if reply_message is not None:
+                reply_message.status = "failed"
+            db.commit()
+            return
+
+        reply_message.content = reply_text
+        reply_message.status = "completed"
+        dispatch.status = "completed"
+        dispatch.channel_trace_id = response_id
+        message.status = "completed"
+        db.commit()
+
+        if response_id:
+            _conversation_state[dispatch.conversation_id] = response_id
+
         await continue_agent_dialogue_after_reply(
             db=db,
             dialogue=dialogue,

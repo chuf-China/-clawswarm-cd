@@ -32,6 +32,14 @@ async def dispatch_direct_message(
 ) -> list[str]:
     """为 direct 会话创建一条 dispatch 并调用 channel。"""
     if conversation.direct_runtime_target_id and not conversation.direct_agent_id:
+        from src.models.runtime_target import RuntimeTarget
+
+        target = db.get(RuntimeTarget, conversation.direct_runtime_target_id)
+        if target is not None and target.runtime_type == "claude-code":
+            from src.services.claude_code_dispatch_service import dispatch_direct_message as dispatch_cc
+
+            return await dispatch_cc(db=db, conversation=conversation, message=message)
+
         from src.services.hermes_dispatch_service import dispatch_hermes_direct_message
 
         return await dispatch_hermes_direct_message(db=db, conversation=conversation, message=message)
@@ -129,13 +137,65 @@ async def dispatch_group_message(
         raise HTTPException(status_code=404, detail="group not found")
 
     members = list(db.scalars(select(ChatGroupMember).where(ChatGroupMember.group_id == group.id)))
-    agents = {agent.id: agent for agent in db.scalars(select(AgentProfile).where(AgentProfile.id.in_([m.agent_id for m in members])))}
-    by_instance: dict[int, list[AgentProfile]] = {}
+    agents = {agent.id: agent for agent in db.scalars(select(AgentProfile).where(AgentProfile.id.in_([m.agent_id for m in members if m.agent_id is not None])))}
 
+    # Separate OpenClaw members and runtime target members
+    openclaw_members: list[ChatGroupMember] = []
+    runtime_members: list[ChatGroupMember] = []
+    for member in members:
+        if member.runtime_target_id is not None:
+            runtime_members.append(member)
+        elif member.instance_id is not None and member.agent_id is not None:
+            openclaw_members.append(member)
+
+    wanted = {token.strip().lower() for token in mentions} if mentions else set()
+    created_dispatch_ids: list[str] = []
+
+    # === Dispatch to Runtime Target members (Claude Code, Hermes) ===
+    if runtime_members:
+        from src.models.runtime_target import RuntimeTarget
+
+        for member in runtime_members:
+            target = db.get(RuntimeTarget, member.runtime_target_id)
+            if not target or not target.enabled:
+                continue
+            if wanted:
+                tokens = {
+                    (target.display_name or target.target_key).lower(),
+                    (target.cs_id or "").lower(),
+                    target.target_key.lower(),
+                }
+                if not (tokens & wanted):
+                    continue
+
+            if target.runtime_type == "claude-code":
+                from src.services.claude_code_dispatch_service import dispatch_group_broadcast as dispatch_cc_group
+
+                d_id = await dispatch_cc_group(
+                    db=db, conversation=conversation, message=message,
+                    group=group, target=target, mentions=mentions,
+                )
+                if d_id:
+                    created_dispatch_ids.append(d_id)
+            elif target.runtime_type == "hermes":
+                from src.services.hermes_dispatch_service import dispatch_hermes_direct_message as dispatch_hermes
+
+                d_ids = await dispatch_hermes(
+                    db=db, conversation=conversation, message=message,
+                    runtime_target=target,
+                )
+                created_dispatch_ids.extend(d_ids)
+
+    # === Dispatch to OpenClaw Agent members (original logic) ===
+    if not openclaw_members:
+        if created_dispatch_ids:
+            return created_dispatch_ids
+        raise HTTPException(status_code=400, detail="no group members matched current message")
+
+    by_instance: dict[int, list[AgentProfile]] = {}
     if mentions:
-        wanted = {token.strip().lower() for token in mentions if token.strip()}
         filtered = []
-        for member in members:
+        for member in openclaw_members:
             agent = agents.get(member.agent_id)
             if not agent:
                 continue
@@ -147,15 +207,15 @@ async def dispatch_group_message(
             if tokens & wanted:
                 filtered.append((member.instance_id, agent))
     else:
-        filtered = [(member.instance_id, agents[member.agent_id]) for member in members if member.agent_id in agents]
+        filtered = [(member.instance_id, agents[member.agent_id]) for member in openclaw_members if member.agent_id in agents]
 
     if not filtered:
+        if created_dispatch_ids:
+            return created_dispatch_ids
         raise HTTPException(status_code=400, detail="no group members matched current message")
 
     for instance_id, agent in filtered:
         by_instance.setdefault(instance_id, []).append(agent)
-
-    created_dispatch_ids: list[str] = []
 
     for instance_id, instance_agents in by_instance.items():
         instance = db.get(OpenClawInstance, instance_id)
@@ -193,7 +253,6 @@ async def dispatch_group_message(
                     dispatch.status = "accepted"
             continue
 
-        # 先提交本地 dispatch 记录，外部 OpenClaw 调用期间不持有 SQLite 写锁。
         db.commit()
 
         group_member_lines = []

@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.models.agent_profile import AgentProfile
+from src.models.claude_code_instance import ClaudeCodeInstance
 from src.models.hermes_instance import HermesInstance
 from src.models.openclaw_instance import OpenClawInstance
 from src.models.runtime_target import RuntimeTarget
@@ -14,6 +15,11 @@ from src.services.agent_cs_id import ensure_agent_cs_id
 def format_hermes_cs_id(instance_id: int) -> str:
     """Hermes Endpoint 使用独立前缀，避免和 OpenClaw Agent 的 CSA 编号冲突。"""
     return f"CSH-{instance_id:04d}"
+
+
+def format_claude_code_cs_id(instance_id: int) -> str:
+    """Claude Code 实例使用独立前缀。"""
+    return f"CSC-{instance_id:04d}"
 
 
 def sync_hermes_runtime_target(
@@ -58,6 +64,58 @@ def sync_hermes_runtime_target(
     instance.runtime_target_id = target.id
     db.flush()
     return target
+
+
+def sync_claude_code_runtime_target(
+    *,
+    db: Session,
+    instance: ClaudeCodeInstance,
+) -> RuntimeTarget:
+    """让 Claude Code 实例与统一 Runtime Target 保持一致。"""
+    cs_id = (instance.cs_id or "").strip() or format_claude_code_cs_id(instance.id)
+    instance.cs_id = cs_id
+
+    target = db.get(RuntimeTarget, instance.runtime_target_id) if instance.runtime_target_id else None
+    if target is None:
+        target = db.scalar(
+            select(RuntimeTarget).where(
+                RuntimeTarget.runtime_type == "claude-code",
+                RuntimeTarget.runtime_instance_id == instance.id,
+                RuntimeTarget.runtime_profile_id == instance.id,
+            )
+        )
+    if target is None:
+        target = RuntimeTarget(
+            runtime_type="claude-code",
+            runtime_instance_id=instance.id,
+            runtime_profile_id=instance.id,
+            target_key=instance.instance_key,
+            display_name=instance.display_name,
+            role_name=instance.role_name,
+            cs_id=cs_id,
+            enabled=instance.status != "disabled",
+        )
+        db.add(target)
+        db.flush()
+    else:
+        target.runtime_instance_id = instance.id
+        target.runtime_profile_id = instance.id
+        target.target_key = instance.instance_key
+        target.display_name = instance.display_name
+        target.role_name = instance.role_name
+        target.cs_id = cs_id
+        target.enabled = instance.status != "disabled"
+    instance.runtime_target_id = target.id
+    db.flush()
+    return target
+
+
+def ensure_claude_code_runtime_targets(db: Session) -> None:
+    """为当前 Claude Code 实例补齐 Runtime Target。"""
+    instances = list(db.scalars(select(ClaudeCodeInstance).order_by(ClaudeCodeInstance.id)))
+    for instance in instances:
+        sync_claude_code_runtime_target(db=db, instance=instance)
+    db.flush()
 
 
 def sync_openclaw_runtime_target(
@@ -147,6 +205,14 @@ def ensure_runtime_target_dispatchable(db: Session, target: RuntimeTarget) -> Ru
             raise HTTPException(status_code=400, detail="runtime target is disabled")
         sync_hermes_runtime_target(db=db, instance=instance)
         return target
+    if target.runtime_type == "claude-code":
+        instance = db.get(ClaudeCodeInstance, target.runtime_instance_id)
+        if not instance:
+            raise HTTPException(status_code=404, detail="Claude Code instance not found")
+        if instance.status == "disabled":
+            raise HTTPException(status_code=400, detail="runtime target is disabled")
+        sync_claude_code_runtime_target(db=db, instance=instance)
+        return target
     raise HTTPException(status_code=400, detail="unsupported runtime target type")
 
 
@@ -154,6 +220,7 @@ def list_runtime_targets(db: Session) -> list[dict[str, object]]:
     """返回当前可用于选择的 Runtime Target。"""
     ensure_openclaw_runtime_targets(db)
     ensure_hermes_runtime_targets(db)
+    ensure_claude_code_runtime_targets(db)
 
     targets = list(db.scalars(select(RuntimeTarget).where(RuntimeTarget.enabled.is_(True)).order_by(RuntimeTarget.runtime_type, RuntimeTarget.id)))
     rows: list[dict[str, object]] = []
@@ -173,6 +240,13 @@ def list_runtime_targets(db: Session) -> list[dict[str, object]]:
                 target.enabled = False
                 continue
             sync_hermes_runtime_target(db=db, instance=instance)
+            instance_name = instance.name
+        elif target.runtime_type == "claude-code":
+            instance = db.get(ClaudeCodeInstance, target.runtime_instance_id)
+            if not instance or instance.status == "disabled":
+                target.enabled = False
+                continue
+            sync_claude_code_runtime_target(db=db, instance=instance)
             instance_name = instance.name
         else:
             continue

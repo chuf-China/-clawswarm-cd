@@ -120,15 +120,17 @@ const { t } = useI18n();
 const sourceRuntimeTargetId = ref<number | null>(null);
 const targetRuntimeTargetId = ref<number | null>(null);
 const topic = ref("");
-const windowSeconds = ref(300);
-const softMessageLimit = ref(12);
-const hardMessageLimit = ref(20);
+const windowSeconds = ref(600);
+const softMessageLimit = ref(30);
+const hardMessageLimit = ref(50);
 
 const runtimeTargetOptions = computed<RuntimeTargetOption[]>(() =>
     props.runtimeTargets.map((target) => {
         const runtimeLabel = target.runtimeType === "hermes"
             ? t("conversation.runtimeHermesEndpoint")
-            : t("conversation.runtimeOpenClawAgent");
+            : target.runtimeType === "claude-code"
+                ? t("conversation.runtimeClaudeCodeAgent")
+                : t("conversation.runtimeOpenClawAgent");
         const meta = [target.instanceName, runtimeLabel, target.csId].filter(Boolean).join(" / ");
         return {
             value: target.id,
@@ -162,9 +164,9 @@ watch(
         sourceRuntimeTargetId.value = null;
         targetRuntimeTargetId.value = null;
         topic.value = "";
-        windowSeconds.value = 300;
-        softMessageLimit.value = 12;
-        hardMessageLimit.value = 20;
+        windowSeconds.value = 600;
+        softMessageLimit.value = 30;
+        hardMessageLimit.value = 50;
     },
 );
 

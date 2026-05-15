@@ -20,9 +20,9 @@ class AgentDialogueCreate(BaseModel):
     source_runtime_target_id: int | None = None
     target_runtime_target_id: int | None = None
     topic: str = Field(min_length=1)
-    window_seconds: int = Field(default=300, ge=60, le=3600)
-    soft_message_limit: int = Field(default=12, ge=2, le=100)
-    hard_message_limit: int = Field(default=20, ge=3, le=200)
+    window_seconds: int = Field(default=600, ge=60, le=3600)
+    soft_message_limit: int = Field(default=30, ge=2, le=100)
+    hard_message_limit: int = Field(default=50, ge=3, le=200)
 
     @root_validator(skip_on_failure=True)
     def validate_thresholds(cls, values: dict) -> dict:

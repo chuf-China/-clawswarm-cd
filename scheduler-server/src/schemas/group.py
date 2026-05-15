@@ -9,8 +9,9 @@ from src.schemas.common import TimestampedModel
 
 
 class GroupMemberAddItem(BaseModel):
-    instance_id: int
-    agent_id: int
+    instance_id: int | None = None
+    agent_id: int | None = None
+    runtime_target_id: int | None = None
 
 
 class GroupCreate(BaseModel):
@@ -30,16 +31,18 @@ class GroupMemberAddRequest(BaseModel):
 
 
 class GroupMemberRead(BaseModel):
-    # 这里把成员关系、Agent 展示名和实例名一起返回，方便前端直接渲染。
     id: int
     group_id: int
-    instance_id: int
-    agent_id: int
+    instance_id: int | None = None
+    agent_id: int | None = None
+    runtime_target_id: int | None = None
     joined_at: str
-    agent_key: str
+    agent_key: str | None = None
     display_name: str
     role_name: str | None
-    instance_name: str
+    instance_name: str | None = None
+    runtime_type: str | None = None
+    cs_id: str | None = None
 
 
 class GroupDetail(BaseModel):

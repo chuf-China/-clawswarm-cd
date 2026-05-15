@@ -45,6 +45,9 @@
       <el-tab-pane label="Hermes" name="hermes">
         <HermesManagementPane />
       </el-tab-pane>
+      <el-tab-pane label="Claude Code" name="claude-code">
+        <ClaudeCodeManagementPane />
+      </el-tab-pane>
     </el-tabs>
 
     <InstanceCreateDrawer
@@ -82,6 +85,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import AgentCreateDrawer from "@/pages/openclaws/components/AgentCreateDrawer.vue";
+import ClaudeCodeManagementPane from "@/pages/openclaws/components/ClaudeCodeManagementPane.vue";
 import HermesManagementPane from "@/pages/openclaws/components/HermesManagementPane.vue";
 import InstanceCreateDrawer from "@/pages/openclaws/components/InstanceCreateDrawer.vue";
 import InstanceCard from "@/pages/openclaws/components/InstanceCard.vue";
@@ -104,7 +108,9 @@ const route = useRoute();
 const router = useRouter();
 
 const createDrawerVisible = ref(false);
-const activeTab = ref<"openclaw" | "hermes">(route.query.tab === "hermes" ? "hermes" : "openclaw");
+const activeTab = ref<"openclaw" | "hermes" | "claude-code">(
+    route.query.tab === "hermes" ? "hermes" : route.query.tab === "claude-code" ? "claude-code" : "openclaw"
+);
 const editDrawerVisible = ref(false);
 const agentDrawerVisible = ref(false);
 const agentDrawerMode = ref<"create" | "edit">("create");
@@ -179,11 +185,11 @@ function stopInstancePolling() {
 }
 
 function handleTabChange(tabName: string | number) {
-  const nextTab = tabName === "hermes" ? "hermes" : "openclaw";
+  const nextTab = tabName === "hermes" ? "hermes" : tabName === "claude-code" ? "claude-code" : "openclaw";
   void router.replace({
     query: {
       ...route.query,
-      tab: nextTab === "hermes" ? "hermes" : undefined,
+      tab: nextTab !== "openclaw" ? nextTab : undefined,
     },
   });
 }

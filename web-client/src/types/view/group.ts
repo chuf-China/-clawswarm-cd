@@ -11,8 +11,9 @@ export type GroupMemberOutput = Camelized<GroupMemberResponse>;
 export type GroupDetailOutput = Camelized<GroupDetailResponse>;
 
 export interface GroupMemberInput {
-    instanceId: number;
-    agentId: number;
+    instanceId?: number;
+    agentId?: number;
+    runtimeTargetId?: number;
 }
 
 export interface GroupCreateInput {

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -28,9 +31,15 @@ async def dispatch_hermes_direct_message(
     db: Session,
     conversation: Conversation,
     message: Message,
+    runtime_target: RuntimeTarget | None = None,
 ) -> list[str]:
-    """把用户消息发送给 Hermes Endpoint，并同步写入回复。"""
-    target = db.get(RuntimeTarget, conversation.direct_runtime_target_id)
+    """把用户消息发送给 Hermes Endpoint，并同步写入回复。
+
+    参数 runtime_target 可选；如果未提供则从 conversation.direct_runtime_target_id 读取。
+    """
+    target = runtime_target
+    if target is None:
+        target = db.get(RuntimeTarget, conversation.direct_runtime_target_id)
     if not target or target.runtime_type != "hermes":
         raise HTTPException(status_code=400, detail="invalid Hermes conversation target")
     instance = db.get(HermesInstance, target.runtime_instance_id)
@@ -83,13 +92,19 @@ async def dispatch_hermes_direct_message(
     await publish_hermes_update(conversation.id, reply_message.id)
 
     try:
-        reply_text, response_id, conversation_key = await stream_hermes_response_to_message(
-            db=db,
-            instance=instance,
-            payload=payload,
-            conversation_id=conversation.id,
-            reply_message=reply_message,
+        reply_text, response_id, conversation_key = await asyncio.wait_for(
+            stream_hermes_response_to_message(
+                db=db,
+                instance=instance,
+                payload=payload,
+                conversation_id=conversation.id,
+                reply_message=reply_message,
+            ),
+            timeout=900.0,
         )
+    except asyncio.TimeoutError as exc:
+        mark_hermes_dispatch_failed(db=db, dispatch=dispatch, message=message, reply_message=reply_message, error_message="Hermes dispatch timed out (900s)")
+        raise HTTPException(status_code=504, detail="Hermes timed out") from exc
     except httpx.TimeoutException as exc:
         mark_hermes_dispatch_failed(db=db, dispatch=dispatch, message=message, reply_message=reply_message, error_message="Hermes timed out")
         raise HTTPException(status_code=504, detail="Hermes timed out") from exc
@@ -142,6 +157,9 @@ async def stream_hermes_response_to_message(
     response_id: str | None = None
     conversation_key: str | None = None
     last_flush_at = 0.0
+    tool_call_count = 0
+    current_tool = ""
+    has_real_text = False
 
     async for event in hermes_client.stream_response(instance=instance, payload=payload):
         event_type = str(event.get("type") or event.get("event") or "").strip()
@@ -151,16 +169,32 @@ async def stream_hermes_response_to_message(
                 response_id = str(response_payload.get("id") or response_id or "").strip() or response_id
                 conversation_key = _extract_conversation_key(response_payload) or conversation_key
 
+        if event_type == "response.function_call_arguments.done":
+            tool_call_count += 1
+            current_tool = str(event.get("name") or event.get("function") or current_tool)
+
         delta = extract_stream_text_delta(event)
         if delta:
+            has_real_text = True
             chunks.append(delta)
-            now = time.monotonic()
-            if now - last_flush_at >= STREAM_UPDATE_INTERVAL_SECONDS:
+
+        now = time.monotonic()
+        if now - last_flush_at >= STREAM_UPDATE_INTERVAL_SECONDS:
+            if has_real_text:
                 reply_message.content = "".join(chunks)
-                reply_message.status = "pending"
-                db.commit()
-                await publish_hermes_update(conversation_id, reply_message.id)
-                last_flush_at = now
+            else:
+                parts = ["分析中…"]
+                if tool_call_count:
+                    parts.append(f"第 {tool_call_count} 步")
+                    if current_tool:
+                        parts.append(f"({current_tool})")
+                else:
+                    parts.append("思考中")
+                reply_message.content = "[" + " ".join(parts) + "]"
+            reply_message.status = "pending"
+            db.commit()
+            await publish_hermes_update(conversation_id, reply_message.id)
+            last_flush_at = now
 
     reply_text = "".join(chunks).strip()
     if not reply_text:
@@ -235,7 +269,7 @@ def build_hermes_response_payload(
     model = (instance.default_model or instance.instance_key).strip()
     payload: dict[str, Any] = {
         "model": model,
-        "input": input_text if input_text is not None else message.content,
+        "input": _resolve_attachment_paths(input_text) if input_text is not None else _resolve_attachment_paths(message.content),
     }
     if state.last_response_id:
         payload["previous_response_id"] = state.last_response_id
@@ -253,6 +287,17 @@ def _extract_conversation_key(response: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _resolve_attachment_paths(text: str) -> str:
+    """Replace /uploads/xxx attachment URLs with absolute filesystem paths."""
+    def _replace(m: re.Match) -> str:
+        url = m.group(3)
+        if url.startswith("/uploads/"):
+            abs_path = str(Path(__file__).resolve().parents[3] / "uploads" / url.removeprefix("/uploads/"))
+            return f"[[attachment:{m.group(1)}|{m.group(2)}|{abs_path}]]"
+        return m.group(0)
+    return re.sub(r"\[\[attachment:([^|\]]+)\|([^|\]]*)\|([^\]]+)\]\]", _replace, text)
 
 
 def mark_hermes_dispatch_failed(

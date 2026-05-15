@@ -37,15 +37,28 @@
           >
             <el-option-group
               v-for="instance in instances"
-              :key="instance.id"
+              :key="`oc-${instance.id}`"
               :label="instance.name"
             >
               <el-option
                 v-for="agent in instance.agents"
-                :key="`${instance.id}:${agent.id}`"
+                :key="`oc:${instance.id}:${agent.id}`"
                 :label="`${agent.displayName} / ${instance.name}`"
-                :value="`${instance.id}:${agent.id}`"
+                :value="`oc:${instance.id}:${agent.id}`"
                 :disabled="!agent.enabled"
+              />
+            </el-option-group>
+            <el-option-group
+              v-if="runtimeTargets.length"
+              key="runtime-targets"
+              :label="t('conversation.runtimeTargets')"
+            >
+              <el-option
+                v-for="rt in runtimeTargets"
+                :key="`rt:${rt.id}`"
+                :label="`${rt.displayName} (${rt.runtimeType}) / ${rt.instanceName}`"
+                :value="`rt:${rt.id}`"
+                :disabled="!rt.enabled"
               />
             </el-option-group>
           </el-select>
@@ -70,13 +83,14 @@
  */
 import { ref, watch } from "vue";
 import { useI18n } from "@/composables/useI18n";
-import type { AddressBookInstanceOutput } from "@/types/view/addressBook";
+import type { AddressBookInstanceOutput, AddressBookRuntimeTargetOutput } from "@/types/view/addressBook";
 import type { GroupCreateInput } from "@/types/view/group";
 
 const props = defineProps<{
     visible: boolean;
     submitting: boolean;
     instances: AddressBookInstanceOutput[];
+    runtimeTargets: AddressBookRuntimeTargetOutput[];
 }>();
 
 const emit = defineEmits<{
@@ -104,16 +118,21 @@ function submit() {
     if (!name.value.trim()) {
         return;
     }
+    const members = selectedValues.value.map((value) => {
+        if (value.startsWith("oc:")) {
+            const [, instanceId, agentId] = value.split(":").map(Number);
+            return { instanceId, agentId };
+        }
+        if (value.startsWith("rt:")) {
+            const runtimeTargetId = Number(value.split(":")[1]);
+            return { runtimeTargetId };
+        }
+        return {};
+    });
     emit("submit", {
         name: name.value.trim(),
         description: description.value.trim(),
-        members: selectedValues.value.map((value) => {
-            const [instanceId, agentId] = value.split(":").map((item) => Number(item));
-            return {
-                instanceId,
-                agentId,
-            };
-        }),
+        members,
     });
 }
 </script>

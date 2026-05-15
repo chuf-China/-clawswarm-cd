@@ -24,7 +24,16 @@
           <div v-for="member in group.members" :key="member.id" class="member-row">
             <div>
               <div class="member-row__title">{{ member.displayName }}</div>
-              <div class="member-row__meta">{{ member.instanceName }} / {{ member.agentKey }}</div>
+              <div class="member-row__meta">
+                <template v-if="member.runtimeType">
+                  {{ member.instanceName || '' }} / {{ member.runtimeType }}
+                </template>
+                <template v-else>
+                  {{ member.instanceName }} / {{ member.agentKey }}
+                </template>
+                <el-tag v-if="member.runtimeType === 'claude-code'" size="small" type="warning" effect="plain" style="margin-left: 6px">CC</el-tag>
+                <el-tag v-else-if="member.runtimeType === 'hermes'" size="small" type="primary" effect="plain" style="margin-left: 6px">H</el-tag>
+              </div>
             </div>
             <el-button text type="danger" :disabled="saving" @click="emit('remove-member', member.id)">
               {{ t("conversation.remove") }}
@@ -47,15 +56,28 @@
           >
             <el-option-group
               v-for="instance in instances"
-              :key="instance.id"
+              :key="`oc-${instance.id}`"
               :label="instance.name"
             >
               <el-option
                 v-for="agent in instance.agents"
-                :key="`${instance.id}-${agent.id}`"
+                :key="`oc:${instance.id}:${agent.id}`"
                 :label="`${agent.displayName} / ${instance.name}`"
-                :value="`${instance.id}:${agent.id}`"
-                :disabled="!agent.enabled || existingKeys.has(`${instance.id}:${agent.id}`)"
+                :value="`oc:${instance.id}:${agent.id}`"
+                :disabled="!agent.enabled || existingKeys.has(`oc:${instance.id}:${agent.id}`)"
+              />
+            </el-option-group>
+            <el-option-group
+              v-if="runtimeTargets.length"
+              key="runtime-targets"
+              :label="t('conversation.runtimeTargets')"
+            >
+              <el-option
+                v-for="rt in runtimeTargets"
+                :key="`rt:${rt.id}`"
+                :label="`${rt.displayName} (${rt.runtimeType}) / ${rt.instanceName}`"
+                :value="`rt:${rt.id}`"
+                :disabled="!rt.enabled || existingKeys.has(`rt:${rt.id}`)"
               />
             </el-option-group>
           </el-select>
@@ -85,13 +107,14 @@
 import { computed, ref, watch } from "vue";
 
 import { useI18n } from "@/composables/useI18n";
-import type { AddressBookInstanceOutput } from "@/types/view/addressBook";
+import type { AddressBookInstanceOutput, AddressBookRuntimeTargetOutput } from "@/types/view/addressBook";
 import type { GroupDetailOutput, GroupMemberInput } from "@/types/view/group";
 
 const props = defineProps<{
     visible: boolean;
     group: GroupDetailOutput | null;
     instances: AddressBookInstanceOutput[];
+    runtimeTargets: AddressBookRuntimeTargetOutput[];
     saving: boolean;
 }>();
 
@@ -117,18 +140,26 @@ watch(
 const existingKeys = computed(() => {
     const values = new Set<string>();
     for (const member of props.group?.members ?? []) {
-        values.add(`${member.instanceId}:${member.agentId}`);
+        if (member.runtimeTargetId) {
+            values.add(`rt:${member.runtimeTargetId}`);
+        } else if (member.instanceId && member.agentId) {
+            values.add(`oc:${member.instanceId}:${member.agentId}`);
+        }
     }
     return values;
 });
 
 function submit() {
-    const payload = selectedValues.value.map((value) => {
-        const [instanceId, agentId] = value.split(":").map((item) => Number(item));
-        return {
-            instanceId,
-            agentId,
-        };
+    const payload = selectedValues.value.map((value): GroupMemberInput => {
+        if (value.startsWith("oc:")) {
+            const [, instanceId, agentId] = value.split(":").map(Number);
+            return { instanceId, agentId };
+        }
+        if (value.startsWith("rt:")) {
+            const runtimeTargetId = Number(value.split(":")[1]);
+            return { runtimeTargetId };
+        }
+        return {};
     });
     emit("add-members", payload);
 }
